@@ -9,28 +9,32 @@ import urllib.parse
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# --- Environment variables from Vercel ---
+from api._redis import get_redis
 
+# --- Required env vars ---
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"].encode("utf-8")
 
-# Comma-separated list of Slack channel IDs to broadcast into
-# Example: BROADCAST_CHANNEL_IDS=C01ABCDEF12,C02GHIJKL34
-BROADCAST_CHANNEL_IDS = [
-    cid.strip()
-    for cid in (os.environ.get("BROADCAST_CHANNEL_IDS") or "").split(",")
-    if cid.strip()
-]
-
-# Optional: comma-separated list of Slack user IDs allowed to broadcast.
-# If empty or not set, ANY user can use /partner_broadcast.
+# --- Optional env vars ---
 ALLOWED_BROADCASTERS = {
     uid.strip()
     for uid in (os.environ.get("ALLOWED_BROADCASTERS") or "").split(",")
     if uid.strip()
 }
 
+# High cap by default; set MAX_BROADCAST_CHANNELS=1000 if you want
+MAX_BROADCAST_CHANNELS = int(os.environ.get("MAX_BROADCAST_CHANNELS", "500"))
+
+# Optional anti-spam cooldown per user (seconds). 0 disables.
+BROADCAST_COOLDOWN_SECONDS = int(os.environ.get("BROADCAST_COOLDOWN_SECONDS", "0"))
+
+# Throttle between sends (seconds) to smooth bursts
+POST_THROTTLE_SECONDS = float(os.environ.get("POST_THROTTLE_SECONDS", "0.2"))
+
+CHANNEL_SET_KEY = "partner_alert_bot:channels"
+
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
+redis = get_redis()
 
 
 def user_is_allowed(user_id: str) -> bool:
@@ -40,14 +44,12 @@ def user_is_allowed(user_id: str) -> bool:
 
 
 def verify_slack_signature(headers, body: bytes) -> bool:
-    """Verify request signature from Slack."""
     timestamp = headers.get("X-Slack-Request-Timestamp", "")
     signature = headers.get("X-Slack-Signature", "")
 
     if not timestamp or not signature:
         return False
 
-    # Protect against replay attacks (5 minute window)
     try:
         ts_int = int(timestamp)
     except ValueError:
@@ -66,6 +68,66 @@ def verify_slack_signature(headers, body: bytes) -> bool:
     return hmac.compare_digest(my_sig, signature)
 
 
+def load_channel_ids() -> list[str]:
+    raw = redis.smembers(CHANNEL_SET_KEY) or []
+    # Normalize potential bytes -> str
+    channel_ids = [
+        c.decode("utf-8") if isinstance(c, (bytes, bytearray)) else str(c)
+        for c in raw
+    ]
+    # stable ordering helps previews look consistent
+    channel_ids.sort()
+    return channel_ids
+
+
+def cooldown_key(user_id: str) -> str:
+    return f"partner_alert_bot:cooldown:{user_id}"
+
+
+def user_in_cooldown(user_id: str) -> bool:
+    if BROADCAST_COOLDOWN_SECONDS <= 0:
+        return False
+    existing = redis.get(cooldown_key(user_id))
+    return existing is not None
+
+
+def set_cooldown(user_id: str):
+    if BROADCAST_COOLDOWN_SECONDS <= 0:
+        return
+    # store a simple timestamp; TTL enforces cooldown
+    redis.set(cooldown_key(user_id), str(int(time.time())), ex=BROADCAST_COOLDOWN_SECONDS)
+
+
+def post_with_rate_limit_retry(channel_id: str, text: str) -> tuple[bool, str | None]:
+    """
+    Returns (ok, error). Retries once if Slack rate-limits with Retry-After.
+    """
+    try:
+        slack_client.chat_postMessage(channel=channel_id, text=text)
+        return True, None
+    except SlackApiError as e:
+        err = e.response.get("error")
+        if err == "ratelimited":
+            # Slack includes Retry-After header in seconds
+            retry_after = 1
+            try:
+                retry_after = int(e.response.headers.get("Retry-After", "1"))
+            except Exception:
+                retry_after = 1
+
+            time.sleep(retry_after + 1)
+
+            # retry once
+            try:
+                slack_client.chat_postMessage(channel=channel_id, text=text)
+                return True, None
+            except SlackApiError as e2:
+                return False, e2.response.get("error") or "ratelimited"
+        return False, err or "SlackApiError"
+    except Exception as e:
+        return False, str(e)
+
+
 class handler(BaseHTTPRequestHandler):
     def _send_json(self, payload, status: int = 200):
         data = json.dumps(payload).encode("utf-8")
@@ -76,48 +138,63 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
-        # Read body
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length)
 
-        # Verify Slack signature
         if not verify_slack_signature(self.headers, body):
             self._send_json({"error": "invalid request signature"}, status=401)
             return
 
-        # Parse Slack's form-encoded payload
         params = urllib.parse.parse_qs(body.decode("utf-8"))
         command = params.get("command", [""])[0]
         user_id = params.get("user_id", [""])[0]
         text_raw = (params.get("text", [""])[0] or "").strip()
 
-        # Only handle our slash command
         if command != "/partner_broadcast":
             self._send_json({"response_type": "ephemeral", "text": "Unknown command."})
             return
 
-        # Permission check
         if not user_is_allowed(user_id):
-            self._send_json(
-                {"response_type": "ephemeral", "text": "You are not allowed to use `/partner_broadcast`."}
-            )
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": "You are not allowed to use `/partner_broadcast`."
+            })
             return
 
-        # Usage
+        # Optional status helper
+        if text_raw.lower() == "status":
+            channel_ids = load_channel_ids()
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": (
+                    f"Tracked channels: {len(channel_ids)}\n"
+                    + (", ".join(channel_ids) if channel_ids else "(none yet)")
+                    + f"\n\nMax cap: {MAX_BROADCAST_CHANNELS}"
+                    + (f"\nCooldown: {BROADCAST_COOLDOWN_SECONDS}s" if BROADCAST_COOLDOWN_SECONDS > 0 else "\nCooldown: off")
+                )
+            })
+            return
+
         if not text_raw:
-            self._send_json(
-                {
-                    "response_type": "ephemeral",
-                    "text": (
-                        "Usage:\n"
-                        "• Preview: `/partner_broadcast Your message here`\n"
-                        "• Confirm: `/partner_broadcast CONFIRM: Your message here`"
-                    ),
-                }
-            )
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": (
+                    "Usage:\n"
+                    "• Preview: `/partner_broadcast Your message here`\n"
+                    "• Confirm: `/partner_broadcast CONFIRM: Your message here`\n"
+                    "• Status: `/partner_broadcast status`"
+                )
+            })
             return
 
-        # Check confirmation prefix
+        # Cooldown check (optional)
+        if user_in_cooldown(user_id):
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": f"Broadcast cooldown active. Try again in a bit."
+            })
+            return
+
         confirm_prefix = "CONFIRM:"
         is_confirm = False
         if text_raw.upper().startswith(confirm_prefix):
@@ -127,68 +204,79 @@ class handler(BaseHTTPRequestHandler):
             text = text_raw
 
         if not text:
-            self._send_json(
-                {
-                    "response_type": "ephemeral",
-                    "text": (
-                        "Your message is empty after the CONFIRM prefix.\n"
-                        "Usage: `/partner_broadcast CONFIRM: Your message here`"
-                    ),
-                }
-            )
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": "Empty message. Try again with a message body."
+            })
             return
 
-        # No channels configured
-        if not BROADCAST_CHANNEL_IDS:
-            self._send_json(
-                {
-                    "response_type": "ephemeral",
-                    "text": (
-                        "No broadcast channels are configured.\n\n"
-                        "Set BROADCAST_CHANNEL_IDS in Vercel env variables."
-                    ),
-                }
-            )
+        channel_ids = load_channel_ids()
+
+        if not channel_ids:
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": (
+                    "No channels registered yet.\n"
+                    "Invite the bot to at least one partner channel, then try again.\n\n"
+                    "Tip: `/partner_broadcast status`"
+                )
+            })
             return
 
-        # --- PREVIEW ONLY ---
+        # Cap enforcement
+        if len(channel_ids) > MAX_BROADCAST_CHANNELS:
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": (
+                    f"Safety cap triggered: {len(channel_ids)} tracked channels exceeds MAX_BROADCAST_CHANNELS={MAX_BROADCAST_CHANNELS}.\n\n"
+                    "Ask the maintainer to raise MAX_BROADCAST_CHANNELS in Vercel env vars if this is expected."
+                )
+            })
+            return
+
+        # Preview-only
         if not is_confirm:
-            channels_summary = ", ".join(BROADCAST_CHANNEL_IDS)
-            self._send_json(
-                {
-                    "response_type": "ephemeral",
-                    "text": (
-                        "Preview only — nothing sent.\n\n"
-                        f"Message:\n\n{text}\n\n"
-                        f"Would be sent to {len(BROADCAST_CHANNEL_IDS)} channel(s):\n"
-                        f"{channels_summary}\n\n"
-                        "To send, run:\n"
-                        f"`/partner_broadcast CONFIRM: {text}`"
-                    ),
-                }
-            )
+            preview_list = ", ".join(channel_ids[:50])
+            more = ""
+            if len(channel_ids) > 50:
+                more = f"\n…plus {len(channel_ids) - 50} more."
+
+            self._send_json({
+                "response_type": "ephemeral",
+                "text": (
+                    "Preview only — nothing has been sent yet.\n\n"
+                    f"Would send to {len(channel_ids)} channel(s).\n"
+                    f"{preview_list}{more}\n\n"
+                    "If this looks correct, confirm with:\n"
+                    f"`/partner_broadcast CONFIRM: {text}`"
+                )
+            })
             return
 
-        # --- CONFIRMED: SEND BROADCAST ---
+        # Confirmed: send broadcast
+        set_cooldown(user_id)
+
         sent = 0
         failed = []
 
-        for channel_id in BROADCAST_CHANNEL_IDS:
-            try:
-                slack_client.chat_postMessage(channel=channel_id, text=text)
+        for channel_id in channel_ids:
+            ok, err = post_with_rate_limit_retry(channel_id, text)
+            if ok:
                 sent += 1
-                time.sleep(0.2)
-            except SlackApiError as e:
-                failed.append(f"{channel_id} ({e.response['error']})")
-            except Exception as e:
-                failed.append(f"{channel_id} ({e})")
+            else:
+                failed.append(f"{channel_id} ({err})")
+            time.sleep(POST_THROTTLE_SECONDS)
 
         msg = f"Broadcast complete. Sent to {sent} channel(s)."
         if failed:
-            msg += " Failed on: " + ", ".join(failed)
+            # Keep response short; show first chunk of failures
+            head = ", ".join(failed[:20])
+            tail = ""
+            if len(failed) > 20:
+                tail = f" …plus {len(failed) - 20} more."
+            msg += f" Failed on {len(failed)}: {head}{tail}"
 
         self._send_json({"response_type": "ephemeral", "text": msg})
 
-    # Optional GET for basic ping
     def do_GET(self):
-        self._send_json({"ok": True, "message": "Partner Alert Bot (Vercel) is running."})
+        self._send_json({"ok": True, "message": "Partner Alert Bot endpoint is up."})

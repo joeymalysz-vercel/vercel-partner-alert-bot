@@ -25,6 +25,7 @@ def verify_slack_signature(headers, body: bytes) -> bool:
     except ValueError:
         return False
 
+    # 5-minute replay window
     if abs(time.time() - ts_int) > 60 * 5:
         return False
 
@@ -59,25 +60,25 @@ class handler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length)
 
-        # Parse JSON (Slack Events send JSON)
+        # Parse JSON first (needed for url_verification)
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception:
             self._send_text("bad request", status=400)
             return
 
-        # 1) URL verification handshake (Slack expects the raw challenge back)
+        # Slack URL verification handshake:
+        # Slack expects the raw "challenge" string in the response body
         if payload.get("type") == "url_verification":
-            challenge = payload.get("challenge", "")
-            self._send_text(challenge, status=200)
+            self._send_text(payload.get("challenge", ""), status=200)
             return
 
-        # Optional: ignore Slack retries quickly
+        # Slack retries -> respond 200 quickly (idempotent ops anyway)
         if self.headers.get("X-Slack-Retry-Num"):
             self._send_json({"ok": True})
             return
 
-        # 2) Verify signature for real events
+        # Verify signature for real events
         if not verify_slack_signature(self.headers, body):
             self._send_text("invalid signature", status=401)
             return
@@ -87,12 +88,16 @@ class handler(BaseHTTPRequestHandler):
         user = event.get("user")
         channel = event.get("channel")
 
-        # Track channels ONLY when our bot joins/leaves
-        if user == SLACK_BOT_USER_ID and channel:
-            if event_type == "member_joined_channel":
-                redis.sadd(CHANNEL_SET_KEY, channel)
-            elif event_type == "member_left_channel":
-                redis.srem(CHANNEL_SET_KEY, channel)
+        # OPTIMAL FILTER:
+        # Ignore everything unless it is *our bot* joining/leaving a channel
+        if user != SLACK_BOT_USER_ID or not channel:
+            self._send_json({"ok": True})
+            return
+
+        if event_type == "member_joined_channel":
+            redis.sadd(CHANNEL_SET_KEY, channel)
+        elif event_type == "member_left_channel":
+            redis.srem(CHANNEL_SET_KEY, channel)
 
         self._send_json({"ok": True})
 
